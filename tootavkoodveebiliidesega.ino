@@ -21,7 +21,7 @@ TouchController touch(&flashlight, &relay);
 static bool pirStateForWeb = false;
 
 void connectWiFi() {
-    wifiMulti.addAP("Illuminaty", "S330nm1nuk0du!");
+    wifiMulti.addAP("SSID", "Parool");
     Serial.println("Connecting to WiFi...");
     while (wifiMulti.run() != WL_CONNECTED) {
         delay(500);
