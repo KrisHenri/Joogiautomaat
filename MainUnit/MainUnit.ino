@@ -4,16 +4,20 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
+#include <ESPmDNS.h>
 #include "Flashlight.h"
 #include "RelayController.h"
 #include "PIRSensor.h"
 #include "WebServerManager.h"
 #include "TouchController.h"
+#include "M5_PbHub.h"
 
 // First M5Stack Core 2 (Main unit with PbHub)
 M5UnitPbHub pbhub;
 WiFiMulti wifiMulti;
 AsyncWebServer server(80);
+Preferences preferences;
 
 Flashlight flashlight(&pbhub);
 RelayController relay(&pbhub);
@@ -29,110 +33,140 @@ struct FlowSensorData {
 } flowData;
 
 static bool pirStateForWeb = false;
-static int currentTab = 0;  // 0: Main, 1: PIR, 2: Flow Sensor
+static int currentTab = 0;  // 0: Main, 1: PIR, 2: Flow Sensor, 3: WiFi
 static bool lastPirState = false;
 
-// HTML page with combined information
-const char index_html[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>TARK-KRAAN</title>
-    <style>
-        body { font-family: Arial; text-align: center; padding: 20px; }
-        .container { max-width: 800px; margin: 0 auto; }
-        .section { margin: 20px 0; padding: 20px; border: 1px solid #ccc; border-radius: 5px; }
-        button { padding: 15px 30px; font-size: 18px; margin: 10px; }
-        .status { font-size: 20px; margin: 10px 0; }
-        .flow-info { font-size: 20px; margin-top: 20px; }
-        .error { color: red; }
-        .success { color: green; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>TARK-KRAAN</h1>
-        
-        <div class="section">
-            <h2>Control Panel</h2>
-            <button onclick="toggle('flashlight')">Flashlight</button>
-            <button onclick="toggle('relay1')">Relay 1</button>
-            <button onclick="toggle('relay2')">Relay 2</button>
-        </div>
-
-        <div class="section">
-            <h2>PIR Sensor</h2>
-            <p>Status: <span id="pir-status" class="status">Loading...</span></p>
-        </div>
-
-        <div class="section">
-            <h2>Flow Sensor</h2>
-            <p>Flow Rate: <span id="flow-rate" class="status">0.00</span> L/min</p>
-            <p>Total Volume: <span id="total-volume" class="status">0.000</span> L</p>
-            <p>Status: <span id="flow-status" class="status">Loading...</span></p>
-            <button onclick="resetVolume()">Reset Volume</button>
-        </div>
-    </div>
-
-<script>
-// Update all data every second
-setInterval(() => {
-    // Update PIR status
-    fetch('/pir')
-        .then(response => response.text())
-        .then(state => {
-            document.getElementById('pir-status').textContent = state;
-            document.getElementById('pir-status').className = 
-                state === 'ACTIVE' ? 'status success' : 'status';
-        });
-
-    // Update flow sensor data
-    fetch('/flow')
-        .then(response => response.json())
-        .then(data => {
-            document.getElementById('flow-rate').textContent = 
-                data.flowRate.toFixed(2);
-            document.getElementById('total-volume').textContent = 
-                data.totalVolume.toFixed(3);
-            document.getElementById('flow-status').textContent = 
-                data.error ? 'ERROR' : 'OK';
-            document.getElementById('flow-status').className = 
-                data.error ? 'status error' : 'status success';
-        });
-}, 1000);
-
-function toggle(device) {
-    fetch('/toggle?device=' + device)
-        .then(res => res.text())
-        .then(alert);
+void loadSavedWiFiCredentials() {
+    preferences.begin("wifi", true);
+    String savedSSID = preferences.getString("ssid", "");
+    String savedPassword = preferences.getString("password", "");
+    preferences.end();
+    
+    // Add default network
+    wifiMulti.addAP("Illuminaty", "S330nm1nuk0du!");
+    
+    // Add saved network if exists
+    if (savedSSID.length() > 0) {
+        Serial.println("Found saved WiFi credentials: " + savedSSID);
+        wifiMulti.addAP(savedSSID.c_str(), savedPassword.c_str());
+    }
 }
-
-function resetVolume() {
-    fetch('/flow/reset')
-        .then(res => res.text())
-        .then(alert);
-}
-</script>
-</body>
-</html>
-)rawliteral";
 
 void connectWiFi() {
-    wifiMulti.addAP("Illuminaty", "S330nm1nuk0du!");
+    Serial.println("Loading WiFi credentials...");
+    loadSavedWiFiCredentials();
+    
     Serial.println("Connecting to WiFi...");
-    while (wifiMulti.run() != WL_CONNECTED) {
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(10, 50);
+    M5.Lcd.println("Connecting to WiFi...");
+    
+    int attempts = 0;
+    while (wifiMulti.run() != WL_CONNECTED && attempts < 30) {
         delay(500);
         Serial.print(".");
+        M5.Lcd.print(".");
+        attempts++;
     }
-    Serial.println("\nWiFi connected!");
-    Serial.println(WiFi.localIP());
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi connected!");
+        Serial.println("SSID: " + WiFi.SSID());
+        Serial.println("IP: " + WiFi.localIP().toString());
+        
+        // Initialize mDNS for auto-discovery
+        if (!MDNS.begin("joogimasin")) {
+            Serial.println("Error setting up mDNS responder!");
+        } else {
+            Serial.println("mDNS responder started as 'joogimasin.local'");
+            MDNS.addService("http", "tcp", 80);
+        }
+        
+        M5.Lcd.setCursor(10, 90);
+        M5.Lcd.setTextColor(GREEN);
+        M5.Lcd.println("Connected!");
+        M5.Lcd.setCursor(10, 130);
+        M5.Lcd.setTextColor(WHITE);
+        M5.Lcd.println("SSID: " + WiFi.SSID());
+        M5.Lcd.setCursor(10, 170);
+        M5.Lcd.println("IP: " + WiFi.localIP().toString());
+        M5.Lcd.setCursor(10, 190);
+        M5.Lcd.setTextSize(1);
+        M5.Lcd.println("Discoverable as: joogimasin.local");
+        delay(3000);
+    } else {
+        Serial.println("\nWiFi connection failed!");
+        M5.Lcd.setCursor(10, 90);
+        M5.Lcd.setTextColor(RED);
+        M5.Lcd.println("Connection Failed!");
+        M5.Lcd.setCursor(10, 130);
+        M5.Lcd.setTextColor(WHITE);
+        M5.Lcd.println("Check credentials or");
+        M5.Lcd.setCursor(10, 170);
+        M5.Lcd.println("use web interface");
+        delay(3000);
+    }
+}
+
+void drawWiFiTab() {
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.setTextSize(2);
+    
+    // Draw header
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.println("WiFi Information");
+    
+    // Draw current connection status
+    M5.Lcd.setCursor(10, 50);
+    if (WiFi.status() == WL_CONNECTED) {
+        M5.Lcd.setTextColor(GREEN);
+        M5.Lcd.println("Status: Connected");
+        M5.Lcd.setTextColor(WHITE);
+        
+        M5.Lcd.setCursor(10, 90);
+        M5.Lcd.println("SSID: " + WiFi.SSID());
+        
+        M5.Lcd.setCursor(10, 130);
+        M5.Lcd.println("IP: " + WiFi.localIP().toString());
+        
+        M5.Lcd.setCursor(10, 170);
+        M5.Lcd.printf("Signal: %d dBm", WiFi.RSSI());
+    } else {
+        M5.Lcd.setTextColor(RED);
+        M5.Lcd.println("Status: Disconnected");
+        M5.Lcd.setTextColor(WHITE);
+        
+        M5.Lcd.setCursor(10, 90);
+        M5.Lcd.println("Use web interface");
+        M5.Lcd.setCursor(10, 130);
+        M5.Lcd.println("to configure WiFi");
+    }
+    
+    // Instructions
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setCursor(10, 210);
+    M5.Lcd.println("Use web interface for WiFi config");
+}
+
+void updateWiFiTab() {
+    static unsigned long lastUpdate = 0;
+    if (millis() - lastUpdate > 5000) {  // Update every 5 seconds
+        drawWiFiTab();
+        lastUpdate = millis();
+    }
 }
 
 void setup() {
     M5.begin();
     Serial.begin(115200);
     Serial.println("M5Core2 initializing...");
+
+    // Initialize preferences
+    preferences.begin("system", false);
+    preferences.end();
 
     // Initialize I2C for PbHub on Port A
     Wire.begin(32, 33);  // SDA: GPIO32, SCL: GPIO33 for Port A
@@ -199,52 +233,13 @@ void setup() {
     touch.init();
     Serial.println("Touch controller initialized");
 
+    // Connect to WiFi
     connectWiFi();
 
-    // Set up web server routes
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-        request->send_P(200, "text/html", index_html);
-    });
-
-    // PIR status endpoint
-    server.on("/pir", HTTP_GET, [](AsyncWebServerRequest *request) {
-        String state = pirStateForWeb ? "ACTIVE" : "INACTIVE";
-        request->send(200, "text/plain", state);
-    });
-
-    // Flow sensor data endpoint
-    server.on("/flow", HTTP_GET, [](AsyncWebServerRequest *request) {
-        StaticJsonDocument<200> doc;
-        doc["flowRate"] = flowData.flowRate;
-        doc["totalVolume"] = flowData.totalVolume;
-        doc["error"] = flowData.error;
-        
-        String jsonResponse;
-        serializeJson(doc, jsonResponse);
-        request->send(200, "application/json", jsonResponse);
-    });
-
-    // Endpoint to receive data from flow sensor unit
-    server.on("/flow/update", HTTP_POST, [](AsyncWebServerRequest *request) {
-        request->send(200, "text/plain", "OK");
-    }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-        StaticJsonDocument<200> doc;
-        DeserializationError error = deserializeJson(doc, (char*)data);
-        
-        if (!error) {
-            flowData.flowRate = doc["flowRate"] | 0.0f;
-            flowData.totalVolume = doc["totalVolume"] | 0.0f;
-            flowData.error = doc["error"] | false;
-        }
-    });
-
-    // Reset volume endpoint
-    server.on("/flow/reset", HTTP_GET, [](AsyncWebServerRequest *request) {
-        flowData.totalVolume = 0.0f;
-        request->send(200, "text/plain", "Volume reset");
-    });
-
-    // Control endpoints
+    // Initialize web server with WiFi management
+    webServer.setWiFiMulti(&wifiMulti);
+    
+    // Add device control endpoints to the web server
     server.on("/toggle", HTTP_GET, [](AsyncWebServerRequest *request) {
         if (!request->hasParam("device")) {
             request->send(400, "text/plain", "Missing device parameter");
@@ -273,8 +268,82 @@ void setup() {
         request->send(200, "text/plain", response);
     });
 
+    // Add a simple test endpoint for flow sensor connectivity
+    server.on("/flow/test", HTTP_GET, [](AsyncWebServerRequest *request) {
+        Serial.println("Flow test endpoint called");
+        request->send(200, "text/plain", "Flow endpoint is working");
+    });
+
+    // Add flow update endpoint to handle data from flow sensor unit
+    server.on("/flow/update", HTTP_ANY, [](AsyncWebServerRequest *request) {
+        if (request->method() == HTTP_GET) {
+            Serial.println("=== Flow update GET endpoint called ===");
+            
+            if (request->hasParam("flowRate") && request->hasParam("totalVolume") && request->hasParam("error")) {
+                float newFlowRate = request->getParam("flowRate")->value().toFloat();
+                float newTotalVolume = request->getParam("totalVolume")->value().toFloat();
+                bool newError = request->getParam("error")->value() == "true";
+                
+                // Update the global flow data
+                flowData.flowRate = newFlowRate;
+                flowData.totalVolume = newTotalVolume;
+                flowData.error = newError;
+                
+                Serial.printf("=== FLOW DATA UPDATED via GET ===\n");
+                Serial.printf("Rate: %.2f L/min\n", flowData.flowRate);
+                Serial.printf("Volume: %.3f L\n", flowData.totalVolume);
+                Serial.printf("Error: %s\n", flowData.error ? "true" : "false");
+                Serial.println("=== UPDATE COMPLETE ===");
+                
+                // Also update the WebServerManager data
+                webServer.updateFlowData(flowData.flowRate, flowData.totalVolume, flowData.error);
+                
+                request->send(200, "text/plain", "OK");
+            } else {
+                Serial.println("GET request missing parameters!");
+                request->send(400, "text/plain", "Missing parameters");
+            }
+        } else if (request->method() == HTTP_POST) {
+            Serial.println("Flow update POST endpoint called");
+            request->send(200, "text/plain", "OK");
+        } else {
+            request->send(405, "text/plain", "Method not allowed");
+        }
+    }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+        // Only handle POST body data
+        if (request->method() != HTTP_POST) return;
+        Serial.printf("Body callback: len=%d, index=%d, total=%d\n", len, index, total);
+        
+        // Only process when we have all the data
+        if (index + len == total && total > 0) {
+            // Create a proper null-terminated string
+            char* jsonStr = new char[total + 1];
+            memcpy(jsonStr, data, len);
+            jsonStr[total] = '\0';
+            
+            Serial.printf("Received JSON: %s\n", jsonStr);
+            
+            DynamicJsonDocument doc(512);
+            DeserializationError error = deserializeJson(doc, jsonStr);
+            
+            if (!error) {
+                flowData.flowRate = doc["flowRate"] | 0.0f;
+                flowData.totalVolume = doc["totalVolume"] | 0.0f;
+                flowData.error = doc["error"] | false;
+                Serial.printf("Flow data updated via POST: Rate=%.2f L/min, Volume=%.3f L, Error=%s\n", 
+                             flowData.flowRate, flowData.totalVolume, flowData.error ? "true" : "false");
+            } else {
+                Serial.printf("JSON parse error: %s\n", error.c_str());
+            }
+            
+            delete[] jsonStr;
+        }
+    });
+
+    // Start the web server and web server manager
+    webServer.begin();
     server.begin();
-    Serial.println("Web server started");
+    Serial.println("Web server with WiFi management started");
 
     // Draw initial UI
     touch.drawUI(false);
@@ -282,6 +351,19 @@ void setup() {
 
 void loop() {
     M5.update();
+    
+    // Prevent watchdog reset
+    yield();
+    
+    // Check free heap memory periodically
+    static unsigned long lastMemoryCheck = 0;
+    if (millis() - lastMemoryCheck > 10000) { // Every 10 seconds
+        size_t freeHeap = ESP.getFreeHeap();
+        if (freeHeap < 10000) { // Less than 10KB free
+            Serial.printf("WARNING: Low memory! Free heap: %d bytes\n", freeHeap);
+        }
+        lastMemoryCheck = millis();
+    }
 
     // Check PIR sensor and handle flashlight
     pir.check(flashlight.state, [](bool on) {
@@ -292,6 +374,17 @@ void loop() {
     
     // Update components
     touch.update();
+    webServer.update();
+    
+    // Update web server with current flow data (less frequently)
+    static unsigned long lastFlowUpdate = 0;
+    if (millis() - lastFlowUpdate > 1000) { // Only every second
+        webServer.updateFlowData(flowData.flowRate, flowData.totalVolume, flowData.error);
+        lastFlowUpdate = millis();
+    }
+    
+    // Additional yield to prevent watchdog issues
+    yield();
 
     // Handle tab switching with buttons
     if (M5.BtnA.wasPressed()) {
@@ -303,8 +396,12 @@ void loop() {
         pir.drawTab();
     }
     if (M5.BtnC.wasPressed()) {
-        currentTab = 2;  // Flow Sensor tab
-        drawFlowSensorTab();
+        currentTab = (currentTab == 2) ? 3 : 2;  // Toggle between Flow Sensor and WiFi tabs
+        if (currentTab == 2) {
+            drawFlowSensorTab();
+        } else {
+            drawWiFiTab();
+        }
     }
 
     // Get current PIR state
@@ -325,7 +422,15 @@ void loop() {
             break;
             
         case 2:  // Flow Sensor tab
-            updateFlowSensorTab();
+            static unsigned long lastFlowDisplayUpdate = 0;
+            if (millis() - lastFlowDisplayUpdate > 500) { // Update display every 500ms
+                updateFlowSensorTab();
+                lastFlowDisplayUpdate = millis();
+            }
+            break;
+            
+        case 3:  // WiFi tab
+            updateWiFiTab();
             break;
     }
 
@@ -356,6 +461,14 @@ void drawFlowSensorTab() {
 }
 
 void updateFlowSensorTab() {
+    // Clear the value areas first
+    M5.Lcd.fillRect(150, 50, 170, 20, BLACK);
+    M5.Lcd.fillRect(150, 90, 170, 20, BLACK);
+    M5.Lcd.fillRect(150, 130, 170, 20, BLACK);
+    
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.setTextSize(2);
+    
     // Update flow rate
     M5.Lcd.setCursor(150, 50);
     M5.Lcd.printf("%.2f L/min", flowData.flowRate);
@@ -371,7 +484,11 @@ void updateFlowSensorTab() {
         M5.Lcd.println("ERROR");
     } else {
         M5.Lcd.setTextColor(GREEN);
-        M5.Lcd.println("OK");
+        M5.Lcd.println("OK   ");  // Extra spaces to clear old text
     }
     M5.Lcd.setTextColor(WHITE);
+    
+    // Debug output
+    Serial.printf("Display updated: %.2f L/min, %.3f L, %s\n", 
+                  flowData.flowRate, flowData.totalVolume, flowData.error ? "ERROR" : "OK");
 }
