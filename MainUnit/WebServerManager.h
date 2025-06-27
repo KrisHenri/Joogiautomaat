@@ -8,10 +8,12 @@
 #include <WiFiMulti.h>
 #include "PIRSensor.h"
 #include "RelayController.h"
+#include "Flashlight.h"
+#include "DispensingController.h"
 
 class WebServerManager {
 public:
-    WebServerManager(PIRSensor* pir, RelayController* relay);
+    WebServerManager(PIRSensor* pir, RelayController* relay, Flashlight* flashlight, DispensingController* dispensing = nullptr);
     void begin();
     void update();
     
@@ -22,17 +24,30 @@ public:
     // Data update functions
     void updateFlowData(float flowRate, float totalVolume, bool error);
     void updatePIRStatus(bool isTriggered);
+    
+    // Callback for flow data updates from external source
+    void setFlowDataCallback(void (*callback)(float, float, bool));
+    
+    // Get current flow data
+    float getFlowRate() const { return flowRate; }
+    float getTotalVolume() const { return totalVolume; }
+    bool getFlowError() const { return flowError; }
 
 private:
     AsyncWebServer server;
     PIRSensor* pirSensor;
     RelayController* relayController;
+    Flashlight* flashlightController;
+    DispensingController* dispensingController;
     WiFiMulti* wifiMultiPtr;
     
     // Flow sensor data (received from FlowSensorUnit)
     float flowRate;
     float totalVolume;
     bool flowError;
+    
+    // Callback for external flow data updates
+    void (*flowDataCallback)(float, float, bool);
     
     void setupRoutes();
     void handleRoot(AsyncWebServerRequest *request);

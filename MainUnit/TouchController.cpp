@@ -99,12 +99,12 @@ void TouchController::drawMainUI(bool pirState) {
                    relayController->getRelay1() ? GREEN : RED);
     M5.Lcd.setCursor(relay1Btn.x + 20, relay1Btn.y + 25);
     M5.Lcd.setTextSize(2);
-    M5.Lcd.print("Relay 1");
+    M5.Lcd.print("Jook 1");
     
     M5.Lcd.fillRect(relay2Btn.x, relay2Btn.y, relay2Btn.w, relay2Btn.h, 
                    relayController->getRelay2() ? GREEN : RED);
     M5.Lcd.setCursor(relay2Btn.x + 20, relay2Btn.y + 25);
-    M5.Lcd.print("Relay 2");
+    M5.Lcd.print("Jook 2");
     
     // Draw settings button
     M5.Lcd.fillRect(settingsBtn.x, settingsBtn.y, settingsBtn.w, settingsBtn.h, BLUE);

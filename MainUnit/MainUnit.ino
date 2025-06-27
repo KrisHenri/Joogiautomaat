@@ -11,18 +11,20 @@
 #include "PIRSensor.h"
 #include "WebServerManager.h"
 #include "TouchController.h"
+#include "DispensingController.h"
 #include "M5_PbHub.h"
 
 // First M5Stack Core 2 (Main unit with PbHub)
 M5UnitPbHub pbhub;
 WiFiMulti wifiMulti;
-AsyncWebServer server(80);
+// Removed duplicate server - using WebServerManager's server instead
 Preferences preferences;
 
 Flashlight flashlight(&pbhub);
 RelayController relay(&pbhub);
 PIRSensor pir(&pbhub);
-WebServerManager webServer(&pir, &relay);
+DispensingController dispensing(&relay);
+WebServerManager webServer(&pir, &relay, &flashlight, &dispensing);
 TouchController touch(&flashlight, &relay);
 
 // Flow sensor data from second unit
@@ -239,110 +241,21 @@ void setup() {
     // Initialize web server with WiFi management
     webServer.setWiFiMulti(&wifiMulti);
     
-    // Add device control endpoints to the web server
-    server.on("/toggle", HTTP_GET, [](AsyncWebServerRequest *request) {
-        if (!request->hasParam("device")) {
-            request->send(400, "text/plain", "Missing device parameter");
-            return;
-        }
-
-        String device = request->getParam("device")->value();
-        String response = "Unknown device";
-
-        if (device == "flashlight") {
-            flashlight.state = !flashlight.state;
-            flashlight.set(flashlight.state);
-            response = flashlight.state ? "Flashlight ON" : "Flashlight OFF";
-        }
-        else if (device == "relay1") {
-            relay.relay1 = !relay.relay1;
-            relay.setRelay1(relay.relay1);
-            response = relay.relay1 ? "Relay 1 ON" : "Relay 1 OFF";
-        }
-        else if (device == "relay2") {
-            relay.relay2 = !relay.relay2;
-            relay.setRelay2(relay.relay2);
-            response = relay.relay2 ? "Relay 2 ON" : "Relay 2 OFF";
-        }
-
-        request->send(200, "text/plain", response);
+    // Set flow data callback to sync with global flow data
+    webServer.setFlowDataCallback([](float rate, float volume, bool error) {
+        flowData.flowRate = rate;
+        flowData.totalVolume = volume;
+        flowData.error = error;
+        Serial.printf("Flow data updated: Rate=%.2f L/min, Volume=%.3f L, Error=%s\n", 
+                     rate, volume, error ? "true" : "false");
     });
+    
+    // Device control endpoints moved to WebServerManager
 
-    // Add a simple test endpoint for flow sensor connectivity
-    server.on("/flow/test", HTTP_GET, [](AsyncWebServerRequest *request) {
-        Serial.println("Flow test endpoint called");
-        request->send(200, "text/plain", "Flow endpoint is working");
-    });
+    // Flow endpoints moved to WebServerManager
 
-    // Add flow update endpoint to handle data from flow sensor unit
-    server.on("/flow/update", HTTP_ANY, [](AsyncWebServerRequest *request) {
-        if (request->method() == HTTP_GET) {
-            Serial.println("=== Flow update GET endpoint called ===");
-            
-            if (request->hasParam("flowRate") && request->hasParam("totalVolume") && request->hasParam("error")) {
-                float newFlowRate = request->getParam("flowRate")->value().toFloat();
-                float newTotalVolume = request->getParam("totalVolume")->value().toFloat();
-                bool newError = request->getParam("error")->value() == "true";
-                
-                // Update the global flow data
-                flowData.flowRate = newFlowRate;
-                flowData.totalVolume = newTotalVolume;
-                flowData.error = newError;
-                
-                Serial.printf("=== FLOW DATA UPDATED via GET ===\n");
-                Serial.printf("Rate: %.2f L/min\n", flowData.flowRate);
-                Serial.printf("Volume: %.3f L\n", flowData.totalVolume);
-                Serial.printf("Error: %s\n", flowData.error ? "true" : "false");
-                Serial.println("=== UPDATE COMPLETE ===");
-                
-                // Also update the WebServerManager data
-                webServer.updateFlowData(flowData.flowRate, flowData.totalVolume, flowData.error);
-                
-                request->send(200, "text/plain", "OK");
-            } else {
-                Serial.println("GET request missing parameters!");
-                request->send(400, "text/plain", "Missing parameters");
-            }
-        } else if (request->method() == HTTP_POST) {
-            Serial.println("Flow update POST endpoint called");
-            request->send(200, "text/plain", "OK");
-        } else {
-            request->send(405, "text/plain", "Method not allowed");
-        }
-    }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-        // Only handle POST body data
-        if (request->method() != HTTP_POST) return;
-        Serial.printf("Body callback: len=%d, index=%d, total=%d\n", len, index, total);
-        
-        // Only process when we have all the data
-        if (index + len == total && total > 0) {
-            // Create a proper null-terminated string
-            char* jsonStr = new char[total + 1];
-            memcpy(jsonStr, data, len);
-            jsonStr[total] = '\0';
-            
-            Serial.printf("Received JSON: %s\n", jsonStr);
-            
-            DynamicJsonDocument doc(512);
-            DeserializationError error = deserializeJson(doc, jsonStr);
-            
-            if (!error) {
-                flowData.flowRate = doc["flowRate"] | 0.0f;
-                flowData.totalVolume = doc["totalVolume"] | 0.0f;
-                flowData.error = doc["error"] | false;
-                Serial.printf("Flow data updated via POST: Rate=%.2f L/min, Volume=%.3f L, Error=%s\n", 
-                             flowData.flowRate, flowData.totalVolume, flowData.error ? "true" : "false");
-            } else {
-                Serial.printf("JSON parse error: %s\n", error.c_str());
-            }
-            
-            delete[] jsonStr;
-        }
-    });
-
-    // Start the web server and web server manager
+    // Start the web server manager (single server)
     webServer.begin();
-    server.begin();
     Serial.println("Web server with WiFi management started");
 
     // Draw initial UI
@@ -380,6 +293,8 @@ void loop() {
     static unsigned long lastFlowUpdate = 0;
     if (millis() - lastFlowUpdate > 1000) { // Only every second
         webServer.updateFlowData(flowData.flowRate, flowData.totalVolume, flowData.error);
+        // Also update dispensing controller with flow data
+        dispensing.updateFlowData(flowData.totalVolume);
         lastFlowUpdate = millis();
     }
     
