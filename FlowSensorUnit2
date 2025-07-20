@@ -1,0 +1,1003 @@
+#include <M5Core2.h>
+#include <WiFi.h>
+#include <WiFiMulti.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <ESPmDNS.h>
+#include <WiFiUdp.h>
+
+// Flow sensor pin
+#define FLOW_SENSOR_PIN 32  // Port A on M5Stack Core 2
+
+// Flow sensor specifications
+// YF-S402 calibration: f = 73×Q formula gives f = 4380 pulses/liter
+#define BASE_FLOW_SENSOR_PULSES_PER_LITER 4380  // Base calibration: f = 73×Q
+#define FLOW_SENSOR_UPDATE_INTERVAL 200   // Update every 200ms (5 times per second)
+
+// Calibration coefficient (adjustable via slider)
+float calibrationCoeff = 1.0f;  // Range: 0.80 to 1.20 (±20%)
+
+// Helper function to get current calibration value
+float getCurrentPulsesPerLiter() {
+    return BASE_FLOW_SENSOR_PULSES_PER_LITER * calibrationCoeff;
+}
+
+// Helper function to get ml per pulse
+float getMlPerPulse() {
+    return 1000.0f / getCurrentPulsesPerLiter();  // Convert L to ml
+}
+
+// WiFi settings
+WiFiMulti wifiMulti;
+
+// Main unit discovery
+const char* mainUnitHostname = "joogimasin";  // Main unit's mDNS hostname
+String mainUnitIP = "";  // Will be discovered automatically
+
+unsigned long lastDiscoveryTime = 0;
+const unsigned long DISCOVERY_INTERVAL = 30000;  // Try to discover every 30 seconds
+int connectionFailureCount = 0;
+const int MAX_FAILURE_COUNT = 3;  // Only rediscover after 3 consecutive failures
+
+// Flow sensor variables
+volatile long pulseCount = 0;          // Pulse count for current interval (gets reset)
+volatile long totalPulseCount = 0;     // Total cumulative pulse count (never reset)
+float flowRate = 0.0f;                 // Flow rate in L/min
+float totalVolume = 0.0f;              // Total volume in L
+bool flowError = false;
+unsigned long lastUpdateTime = 0;
+unsigned long lastPulseTime = 0;
+
+// Flow rate smoothing variables
+float flowRateHistory[5] = {0, 0, 0, 0, 0};  // Store last 5 readings for smoothing
+int flowRateIndex = 0;
+float smoothedFlowRate = 0.0f;
+
+// Display management
+static int currentTab = 0;  // 0: Flow Data, 1: Network Info, 2: Calibration
+static unsigned long lastDisplayUpdate = 0;
+
+// Calibration slider variables
+bool sliderActive = false;
+int sliderX = 50;    // Slider position X
+int sliderY = 140;   // Slider position Y
+int sliderWidth = 220;  // Slider width
+int sliderHeight = 20;  // Slider height
+int sliderKnobX = sliderX + sliderWidth / 2;  // Current knob position
+
+// Dispensing tracking variables for auto-reset
+bool wasDispensing = false;
+float lastTargetVolume = 0.0f;
+unsigned long lastDispensingCheck = 0;
+const unsigned long DISPENSING_CHECK_INTERVAL = 2000; // Check every 2 seconds
+
+// Interrupt service routine for flow sensor
+void IRAM_ATTR pulseCounter() {
+    pulseCount++;           // For interval calculations
+    totalPulseCount++;      // For total cumulative count
+    lastPulseTime = millis();
+    // Note: Don't use Serial.print in interrupt handlers as it can cause issues
+}
+
+String findMainUnitByBroadcast() {
+    WiFiUDP udp;
+    
+    // Start UDP on port 12345
+    if (!udp.begin(12345)) {
+        Serial.println("UDP broadcast discovery failed to start");
+        return "";
+    }
+    
+    Serial.println("Sending broadcast discovery packets...");
+    
+    // Calculate broadcast address for current subnet
+    IPAddress localIP = WiFi.localIP();
+    IPAddress subnetMask = WiFi.subnetMask();
+    IPAddress broadcastAddr;
+    
+    // Calculate broadcast address: IP | (~subnetMask)
+    for (int i = 0; i < 4; i++) {
+        broadcastAddr[i] = localIP[i] | (~subnetMask[i]);
+    }
+    
+    Serial.println("Broadcast address: " + broadcastAddr.toString());
+    
+    // Send discovery packet - MODIFIED FOR UNIT 2
+    String discoveryMsg = "FLOW_SENSOR2_DISCOVERY";
+    udp.beginPacket(broadcastAddr, 12346); // Send to port 12346
+    udp.print(discoveryMsg);
+    udp.endPacket();
+    
+    // Wait for response
+    unsigned long startTime = millis();
+    while (millis() - startTime < 3000) { // Wait up to 3 seconds
+        int packetSize = udp.parsePacket();
+        if (packetSize) {
+            char responseBuffer[64];
+            int len = udp.read(responseBuffer, sizeof(responseBuffer) - 1);
+            responseBuffer[len] = '\0';
+            
+            String response = String(responseBuffer);
+            if (response.startsWith("JOOGIMASIN_RESPONSE:")) {
+                String foundIP = response.substring(20); // Extract IP after "JOOGIMASIN_RESPONSE:"
+                Serial.println("Received response from: " + udp.remoteIP().toString());
+                Serial.println("Main unit reports IP: " + foundIP);
+                udp.stop();
+                return foundIP;
+            }
+        }
+        delay(50);
+    }
+    
+    udp.stop();
+    Serial.println("No broadcast response received");
+    return "";
+}
+
+bool discoverMainUnit() {
+    Serial.println("=== DISCOVERING MAIN UNIT (UNIT 2) ===");
+    Serial.println("Flow sensor 2 IP: " + WiFi.localIP().toString());
+    
+#ifdef MANUAL_MAIN_UNIT_IP
+    // Use manual IP if defined
+    Serial.println("Using MANUAL IP configuration: " + String(MANUAL_MAIN_UNIT_IP));
+    mainUnitIP = MANUAL_MAIN_UNIT_IP;
+    
+    HTTPClient http;
+    http.begin("http://" + mainUnitIP + "/flow2/test");
+    http.setTimeout(3000);
+    
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+        String response = http.getString();
+        Serial.println("Manual IP connection successful: " + response);
+        http.end();
+        return true;
+    } else {
+        Serial.printf("Manual IP connection failed with code: %d\n", httpCode);
+        http.end();
+        return false;
+    }
+#endif
+
+    // Try UDP broadcast discovery first (works across different networks)
+    Serial.println("Trying UDP broadcast discovery...");
+    String broadcastIP = findMainUnitByBroadcast();
+    if (broadcastIP.length() > 0) {
+        mainUnitIP = broadcastIP;
+        Serial.println("*** Found main unit via broadcast at: " + mainUnitIP + " ***");
+        return true;
+    }
+    
+    Serial.println("Looking for hostname: " + String(mainUnitHostname) + ".local");
+    
+    // Multiple attempts at mDNS resolution
+    IPAddress serverIP;
+    bool mdnsFound = false;
+    
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        Serial.printf("mDNS attempt %d/3...\n", attempt);
+        serverIP = MDNS.queryHost(mainUnitHostname);
+        
+        if (serverIP.toString() != "0.0.0.0") {
+            mdnsFound = true;
+            break;
+        }
+        delay(1000); // Wait 1 second between attempts
+    }
+    
+    if (mdnsFound) {
+        mainUnitIP = serverIP.toString();
+        Serial.println("Found main unit via mDNS at: " + mainUnitIP);
+        
+        // Test connectivity to the main unit - MODIFIED FOR UNIT 2
+        HTTPClient http;
+        http.begin("http://" + mainUnitIP + "/flow2/test");
+        http.setTimeout(3000);
+        
+        int httpCode = http.GET();
+        if (httpCode == HTTP_CODE_OK) {
+            String response = http.getString();
+            Serial.println("mDNS connection test successful: " + response);
+            http.end();
+            return true;
+        } else {
+            Serial.printf("mDNS connection test failed with code: %d\n", httpCode);
+            http.end();
+            // Don't return false yet, try other methods
+        }
+    } else {
+        Serial.println("Main unit not found via mDNS, trying fallback methods...");
+        
+        // Try known IP addresses first (faster than scanning)
+        String knownIPs[] = {
+            "192.168.88.188",  // Your known IP
+            "192.168.1.100", 
+            "192.168.0.100",
+            "192.168.4.1",     // Common ESP32 AP mode IP
+            "192.168.1.1",     // Common router IP
+            "10.0.0.1"         // Another common router IP
+        };
+        
+        Serial.println("Trying known IP addresses...");
+        for (int i = 0; i < 6; i++) {
+            Serial.printf("Testing known IP %d/6: %s\n", i+1, knownIPs[i].c_str());
+            
+            HTTPClient http;
+            http.begin("http://" + knownIPs[i] + "/flow2/test");
+            http.setTimeout(2000);
+            
+            int httpCode = http.GET();
+            if (httpCode == HTTP_CODE_OK) {
+                String response = http.getString();
+                if (response.indexOf("Flow endpoint is working") >= 0) {
+                    Serial.println("*** Found main unit at known IP: " + knownIPs[i] + " ***");
+                    mainUnitIP = knownIPs[i];
+                    http.end();
+                    return true;
+                }
+            }
+            http.end();
+            delay(200); // Small delay between attempts
+        }
+        
+        // Try subnet scan as last resort (only common IPs to save time)
+        Serial.println("Trying subnet scan (limited range)...");
+        String baseIP = WiFi.localIP().toString();
+        int lastDot = baseIP.lastIndexOf('.');
+        if (lastDot > 0) {
+            String subnet = baseIP.substring(0, lastDot + 1);
+            Serial.println("Scanning subnet: " + subnet + "x");
+            
+            // Only scan common IP ranges to save time
+            int scanIPs[] = {1, 2, 100, 101, 188, 200, 254};
+            for (int i = 0; i < 7; i++) {
+                String testIP = subnet + String(scanIPs[i]);
+                if (testIP != WiFi.localIP().toString()) {
+                    Serial.println("Scanning: " + testIP);
+                    
+                    HTTPClient http;
+                    http.begin("http://" + testIP + "/flow2/test");
+                    http.setTimeout(1500);
+                    
+                    int httpCode = http.GET();
+                    if (httpCode == HTTP_CODE_OK) {
+                        String response = http.getString();
+                        if (response.indexOf("Flow endpoint is working") >= 0) {
+                            Serial.println("*** Found main unit at: " + testIP + " ***");
+                            mainUnitIP = testIP;
+                            http.end();
+                            return true;
+                        }
+                    }
+                    http.end();
+                    delay(300);
+                }
+            }
+        }
+        
+        return false;
+    }
+}
+
+void connectWiFi() {
+    Serial.println("=== FLOW SENSOR 2 WIFI CONNECTION ===");
+    
+    // Priority 1: Try to connect to main unit's Access Point
+    Serial.println("Connecting to main unit Access Point...");
+    
+    WiFi.begin("Joogimasin-AP", "joogimasin123");
+    
+    // Wait for connection (up to 15 seconds)
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\n*** FLOW SENSOR 2 CONNECTED TO MAIN UNIT ACCESS POINT ***");
+        Serial.println("SSID: " + WiFi.SSID());
+        Serial.println("IP Address: " + WiFi.localIP().toString());
+        
+        // Set main unit IP (always 192.168.4.1 for Access Point)
+        mainUnitIP = "192.168.4.1";
+        Serial.println("Main unit IP: " + mainUnitIP);
+        
+        // Initialize mDNS - MODIFIED FOR UNIT 2
+        if (!MDNS.begin("flowsensor2")) {
+            Serial.println("Error setting up mDNS responder!");
+        } else {
+            Serial.println("mDNS responder started as 'flowsensor2.local'");
+        }
+        
+        Serial.println("Connection successful - ready to send data!");
+        
+    } else {
+        Serial.println("\n*** CONNECTION FAILED ***");
+        Serial.println("Make sure:");
+        Serial.println("1. Main unit is powered on");
+        Serial.println("2. Main unit is running Access Point mode");
+        Serial.println("3. You're within WiFi range");
+        
+        // Optional: Try one fallback network if needed
+        Serial.println("Trying fallback network...");
+        WiFi.begin("Illuminaty", "S330nm1nuk0du!");
+        
+        attempts = 0;
+        while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+            delay(500);
+            Serial.print(".");
+            attempts++;
+        }
+        
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("\nConnected to fallback network");
+            Serial.println("SSID: " + WiFi.SSID());
+            Serial.println("IP Address: " + WiFi.localIP().toString());
+            
+            // Initialize mDNS - MODIFIED FOR UNIT 2
+            if (!MDNS.begin("flowsensor2")) {
+                Serial.println("Error setting up mDNS responder!");
+            } else {
+                Serial.println("mDNS responder started as 'flowsensor2.local'");
+            }
+            
+            // Try known main unit IP
+            mainUnitIP = "192.168.88.188";
+            Serial.println("Will try to find main unit at: " + mainUnitIP);
+        } else {
+            Serial.println("All connection attempts failed!");
+        }
+    }
+}
+
+float calculateSmoothedFlowRate(float newReading) {
+    // Add new reading to history
+    flowRateHistory[flowRateIndex] = newReading;
+    flowRateIndex = (flowRateIndex + 1) % 5;
+    
+    // Calculate average of last 5 readings
+    float sum = 0;
+    for (int i = 0; i < 5; i++) {
+        sum += flowRateHistory[i];
+    }
+    return sum / 5.0f;
+}
+
+void updateFlowSensor() {
+    unsigned long currentTime = millis();
+    
+    // Check for flow sensor error (no pulses for 5 seconds)
+    if (currentTime - lastPulseTime > 5000) {
+        flowError = true;
+        // Clear flow rate history when no flow detected
+        for (int i = 0; i < 5; i++) {
+            flowRateHistory[i] = 0;
+        }
+        smoothedFlowRate = 0;
+    } else {
+        flowError = false;
+    }
+    
+    // Calculate flow rate and volume
+    if (currentTime - lastUpdateTime >= FLOW_SENSOR_UPDATE_INTERVAL) {
+        float actualTimeInterval = (currentTime - lastUpdateTime) / 1000.0f; // Convert to seconds
+        
+        // Debug output
+        if (pulseCount > 0) {
+            Serial.printf("=== FLOW DETECTED (UNIT 2) ===\n");
+            Serial.printf("Pulse count: %ld\n", pulseCount);
+            Serial.printf("Time interval: %.3f seconds\n", actualTimeInterval);
+            Serial.printf("Calibration: %d pulses/liter\n", getCurrentPulsesPerLiter());
+        }
+        
+        // Calculate instantaneous flow rate in L/min
+        float instantaneousFlowRate = 0.0f;
+        if (pulseCount > 0 && actualTimeInterval > 0) {
+            // Improved calculation with minimum time threshold
+            if (actualTimeInterval >= 0.1f) { // Only calculate if we have at least 100ms of data
+                instantaneousFlowRate = (pulseCount * 60.0f) / (getCurrentPulsesPerLiter() * actualTimeInterval);
+                
+                // Apply reasonable limits to prevent unrealistic readings
+                if (instantaneousFlowRate > 50.0f) { // Cap at 50 L/min (very high but possible)
+                    instantaneousFlowRate = 50.0f;
+                    Serial.println("WARNING: Flow rate capped at 50 L/min");
+                }
+            } else {
+                // For very short intervals, use a conservative estimate
+                instantaneousFlowRate = (pulseCount * 60.0f) / (getCurrentPulsesPerLiter() * 0.2f); // Assume 200ms minimum
+                if (instantaneousFlowRate > 10.0f) { // More conservative cap for short intervals
+                    instantaneousFlowRate = 10.0f;
+                }
+                Serial.printf("Short interval detected, using conservative estimate\n");
+            }
+        }
+        
+        // Apply smoothing to reduce erratic readings
+        smoothedFlowRate = calculateSmoothedFlowRate(instantaneousFlowRate);
+        flowRate = smoothedFlowRate;
+        
+        // Calculate volume in liters: pulses / pulses_per_liter
+        float volumeIncrement = (float)pulseCount / getCurrentPulsesPerLiter();
+        totalVolume += volumeIncrement;
+        
+        // Debug output
+        if (pulseCount > 0) {
+            Serial.printf("Instantaneous flow rate: %.2f L/min\n", instantaneousFlowRate);
+            Serial.printf("Smoothed flow rate: %.2f L/min\n", smoothedFlowRate);
+            Serial.printf("Volume increment: %.4f L\n", volumeIncrement);
+            Serial.printf("Total volume: %.3f L\n", totalVolume);
+            Serial.printf("Error status: %s\n", flowError ? "true" : "false");
+            Serial.println("=== FLOW UPDATE COMPLETE (UNIT 2) ===");
+        }
+        
+        // Reset pulse count
+        pulseCount = 0;
+        lastUpdateTime = currentTime;
+    }
+}
+
+void sendDataToMainUnit() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi disconnected, reconnecting...");
+        connectWiFi();
+        return;
+    }
+
+    // Check if we need to discover main unit IP
+    if (mainUnitIP.length() == 0 || (millis() - lastDiscoveryTime > DISCOVERY_INTERVAL)) {
+        Serial.println("Attempting to discover main unit...");
+        if (discoverMainUnit()) {
+            lastDiscoveryTime = millis();
+        } else {
+            Serial.println("Cannot find main unit, skipping data send");
+            return;
+        }
+    }
+
+    HTTPClient http;
+    String url = "http://" + mainUnitIP + "/flow2/update";  // MODIFIED FOR UNIT 2
+    
+    // Try POST method first (JSON)
+    Serial.println("Trying POST method with JSON data...");
+    
+    // Create JSON document
+    StaticJsonDocument<250> doc;
+    doc["flowRate"] = flowRate;
+    doc["totalVolume"] = totalVolume;
+    doc["error"] = flowError;
+    doc["pulseCount"] = totalPulseCount;
+    
+    String jsonData;
+    serializeJson(doc, jsonData);
+    
+    Serial.println("Sending data to: " + url);
+    Serial.println("JSON data: " + jsonData);
+    
+    // Send data to main unit via POST
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(5000); // 5 second timeout
+    
+    int httpCode = http.POST(jsonData);
+    
+    if (httpCode > 0) {
+        if (httpCode == HTTP_CODE_OK) {
+            String response = http.getString();
+            Serial.println("POST data sent successfully to " + mainUnitIP);
+            Serial.println("Response: " + response);
+            connectionFailureCount = 0;  // Reset failure counter on success
+            http.end();
+            return; // Success, exit function
+        } else {
+            Serial.printf("POST HTTP error: %d\n", httpCode);
+            String response = http.getString();
+            Serial.println("POST Error response: " + response);
+        }
+    } else {
+        Serial.printf("POST HTTP request failed: %s\n", http.errorToString(httpCode).c_str());
+    }
+    
+    http.end();
+    
+    // If POST failed, try GET method as fallback
+    Serial.println("POST failed, trying GET method as fallback...");
+    
+    String getUrl = url + "?flowRate=" + String(flowRate, 2) + 
+                   "&totalVolume=" + String(totalVolume, 3) + 
+                   "&error=" + (flowError ? "true" : "false") +
+                   "&pulseCount=" + String(totalPulseCount);
+    
+    Serial.println("GET URL: " + getUrl);
+    
+    http.begin(getUrl);
+    http.setTimeout(5000);
+    
+    httpCode = http.GET();
+    
+    if (httpCode > 0) {
+        if (httpCode == HTTP_CODE_OK) {
+            String response = http.getString();
+            Serial.println("GET data sent successfully to " + mainUnitIP);
+            Serial.println("Response: " + response);
+            connectionFailureCount = 0;  // Reset failure counter on success
+        } else {
+            Serial.printf("GET HTTP error: %d\n", httpCode);
+            String response = http.getString();
+            Serial.println("GET Error response: " + response);
+            connectionFailureCount++;
+            
+            // Only clear IP after multiple failures or specific error codes
+            if (connectionFailureCount >= MAX_FAILURE_COUNT || httpCode == -1 || httpCode == 404) {
+                Serial.printf("Too many failures (%d) or server unreachable, will rediscover main unit\n", connectionFailureCount);
+                mainUnitIP = "";  // Force rediscovery
+                connectionFailureCount = 0;  // Reset counter
+            } else {
+                Serial.printf("Failure %d/%d, keeping current IP for next attempt\n", connectionFailureCount, MAX_FAILURE_COUNT);
+            }
+        }
+    } else {
+        Serial.printf("GET HTTP request failed: %s\n", http.errorToString(httpCode).c_str());
+        connectionFailureCount++;
+        
+        if (connectionFailureCount >= MAX_FAILURE_COUNT) {
+            Serial.printf("Too many connection failures (%d), will rediscover main unit\n", connectionFailureCount);
+            mainUnitIP = "";  // Force rediscovery
+            connectionFailureCount = 0;  // Reset counter
+        } else {
+            Serial.printf("Connection failure %d/%d, keeping current IP for next attempt\n", connectionFailureCount, MAX_FAILURE_COUNT);
+        }
+    }
+    
+    http.end();
+}
+
+void checkDispensingStatus() {
+    // Only check every 2 seconds to avoid excessive requests
+    if (millis() - lastDispensingCheck < DISPENSING_CHECK_INTERVAL) {
+        return;
+    }
+    lastDispensingCheck = millis();
+    
+    if (WiFi.status() != WL_CONNECTED || mainUnitIP.length() == 0) {
+        return; // Can't check if not connected
+    }
+    
+    HTTPClient http;
+    String url = "http://" + mainUnitIP + "/flow2/dispensing";  // MODIFIED FOR UNIT 2
+    
+    http.begin(url);
+    http.setTimeout(3000);
+    
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+        String response = http.getString();
+        
+        // Parse JSON response
+        StaticJsonDocument<200> doc;
+        DeserializationError error = deserializeJson(doc, response);
+        
+        if (!error) {
+            bool isDispensing = doc["isDispensing"] | false;
+            float targetVolume = doc["targetVolume"] | 0.0f;
+            
+            // Check if a new dispensing session started
+            if (isDispensing && !wasDispensing) {
+                // New dispensing started - reset pulse count
+                Serial.println("=== NEW DISPENSING DETECTED - AUTO-RESETTING PULSE COUNT (UNIT 2) ===");
+                Serial.printf("Target volume: %.3f L\n", targetVolume);
+                totalPulseCount = 0;
+                pulseCount = 0;
+                
+                // Show notification on display
+                M5.Lcd.fillScreen(BLACK);
+                M5.Lcd.setTextColor(YELLOW);
+                M5.Lcd.setTextSize(2);
+                M5.Lcd.setCursor(30, 80);
+                M5.Lcd.println("DISPENSING");
+                M5.Lcd.setCursor(50, 110);
+                M5.Lcd.println("STARTED");
+                M5.Lcd.setCursor(20, 140);
+                M5.Lcd.printf("%.2fL Target", targetVolume);
+                M5.Lcd.setTextColor(GREEN);
+                M5.Lcd.setCursor(10, 170);
+                M5.Lcd.println("Pulse Count Reset");
+                delay(1500); // Show message for 1.5 seconds
+            }
+            
+            // Update tracking variables
+            wasDispensing = isDispensing;
+            lastTargetVolume = targetVolume;
+        }
+    }
+    
+    http.end();
+}
+
+void resetVolumeCounter() {
+    // Reset local volume counter and pulse count
+    totalVolume = 0.0f;
+    totalPulseCount = 0;
+    pulseCount = 0;
+    Serial.println("=== VOLUME AND PULSE COUNT RESET LOCALLY (UNIT 2) ===");
+    
+    // Also send reset command to main unit if connected
+    if (WiFi.status() == WL_CONNECTED && mainUnitIP.length() > 0) {
+        HTTPClient http;
+        String resetUrl = "http://" + mainUnitIP + "/flow2/reset";  // MODIFIED FOR UNIT 2
+        
+        Serial.println("Sending volume reset command to main unit...");
+        Serial.println("Reset URL: " + resetUrl);
+        
+        // Try POST method first
+        http.begin(resetUrl);
+        http.addHeader("Content-Type", "application/json");
+        http.setTimeout(3000);
+        
+        // Send empty JSON object for POST
+        String jsonData = "{}";
+        int httpCode = http.POST(jsonData);
+        
+        if (httpCode > 0) {
+            if (httpCode == HTTP_CODE_OK) {
+                String response = http.getString();
+                Serial.println("Volume reset sent successfully to main unit");
+                Serial.println("Response: " + response);
+            } else {
+                Serial.printf("Volume reset POST failed with code: %d\n", httpCode);
+                // Try GET method as fallback
+                http.end();
+                http.begin(resetUrl);
+                httpCode = http.GET();
+                if (httpCode == HTTP_CODE_OK) {
+                    String response = http.getString();
+                    Serial.println("Volume reset sent successfully via GET to main unit");
+                    Serial.println("Response: " + response);
+                } else {
+                    Serial.printf("Volume reset GET also failed with code: %d\n", httpCode);
+                }
+            }
+        } else {
+            Serial.printf("Volume reset request failed: %s\n", http.errorToString(httpCode).c_str());
+        }
+        
+        http.end();
+    } else {
+        Serial.println("Cannot send reset to main unit - not connected");
+    }
+    
+    // Show confirmation message on display
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setTextColor(GREEN);
+    M5.Lcd.setTextSize(3);
+    M5.Lcd.setCursor(50, 100);
+    M5.Lcd.println("VOLUME");
+    M5.Lcd.setCursor(70, 140);
+    M5.Lcd.println("RESET!");
+    delay(1000); // Show message for 1 second
+}
+
+void drawFlowDataTab() {
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.setTextSize(2);
+    
+    // Display header with tab indicator - MODIFIED FOR UNIT 2
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.println("Flow Data 2 [1/2]");
+    
+    // Display flow rate (smoothed)
+    M5.Lcd.setCursor(10, 50);
+    M5.Lcd.print("Flow: ");
+    M5.Lcd.print(flowRate, 2);
+    M5.Lcd.println(" L/min");
+    
+    // Display total volume
+    M5.Lcd.setCursor(10, 80);
+    M5.Lcd.print("Total: ");
+    M5.Lcd.print(totalVolume, 3);
+    M5.Lcd.println(" L");
+    
+    // Display pulse count for debugging
+    M5.Lcd.setCursor(10, 110);
+    M5.Lcd.print("Pulses: ");
+    M5.Lcd.println(totalPulseCount);
+    
+    // Display calibration value (fixed)
+    M5.Lcd.setCursor(10, 130);
+    M5.Lcd.print("Calibration: ");
+    M5.Lcd.setTextColor(CYAN);
+    M5.Lcd.printf("%d", getCurrentPulsesPerLiter());
+    
+    // Display sensor status
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.setCursor(10, 150);
+    M5.Lcd.print("Sensor: ");
+    M5.Lcd.setTextColor(flowError ? RED : GREEN);
+    M5.Lcd.println(flowError ? "ERROR" : "OK");
+    
+    // Display main unit connection status (simplified)
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.setCursor(10, 180);
+    M5.Lcd.print("Main Unit: ");
+    if (mainUnitIP.length() > 0) {
+        M5.Lcd.setTextColor(GREEN);
+        M5.Lcd.println("Connected");
+    } else {
+        M5.Lcd.setTextColor(RED);
+        M5.Lcd.println("Searching...");
+    }
+    
+    // Display button instructions at bottom
+    M5.Lcd.setTextColor(YELLOW);
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setCursor(10, 215);
+    M5.Lcd.println("A:Reset  B:Next Tab  C:Next Tab");
+}
+
+void drawNetworkInfoTab() {
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.setTextSize(2);
+    
+    // Display header with tab indicator - MODIFIED FOR UNIT 2
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.println("Network Info 2 [2/2]");
+    
+    // Connection status
+    M5.Lcd.setCursor(10, 50);
+    if (WiFi.status() == WL_CONNECTED) {
+        M5.Lcd.setTextColor(GREEN);
+        M5.Lcd.println("WiFi: Connected");
+    } else {
+        M5.Lcd.setTextColor(RED);
+        M5.Lcd.println("WiFi: Disconnected");
+    }
+    
+    // Network name
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setCursor(10, 80);
+    M5.Lcd.println("SSID: " + WiFi.SSID());
+    
+    // Connection mode
+    M5.Lcd.setCursor(10, 100);
+    if (WiFi.SSID() == "Joogimasin-AP") {
+        M5.Lcd.setTextColor(YELLOW);
+        M5.Lcd.println("Mode: Direct AP Connection");
+    } else {
+        M5.Lcd.setTextColor(CYAN);
+        M5.Lcd.println("Mode: Network Discovery");
+    }
+    
+    // IP addresses
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.setCursor(10, 120);
+    M5.Lcd.println("Flow Sensor 2 IP:");
+    M5.Lcd.setCursor(10, 140);
+    M5.Lcd.println(WiFi.localIP().toString());
+    
+    M5.Lcd.setCursor(10, 160);
+    M5.Lcd.println("Main Unit IP:");
+    M5.Lcd.setCursor(10, 180);
+    if (mainUnitIP.length() > 0) {
+        M5.Lcd.setTextColor(GREEN);
+        M5.Lcd.println(mainUnitIP);
+    } else {
+        M5.Lcd.setTextColor(RED);
+        M5.Lcd.println("Not found");
+    }
+    
+    // Signal strength (if available)
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.setCursor(10, 200);
+    if (WiFi.status() == WL_CONNECTED) {
+        int rssi = WiFi.RSSI();
+        M5.Lcd.printf("Signal: %d dBm", rssi);
+        if (rssi > -50) {
+            M5.Lcd.setTextColor(GREEN);
+            M5.Lcd.println(" (Excellent)");
+        } else if (rssi > -70) {
+            M5.Lcd.setTextColor(YELLOW);
+            M5.Lcd.println(" (Good)");
+        } else {
+            M5.Lcd.setTextColor(RED);
+            M5.Lcd.println(" (Weak)");
+        }
+    }
+    
+    // Display button instructions at bottom
+    M5.Lcd.setTextColor(YELLOW);
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setCursor(10, 215);
+    M5.Lcd.println("A:Reset  B:Next Tab  C:Next Tab");
+}
+
+void drawSlider() {
+    // Draw slider track
+    M5.Lcd.fillRect(sliderX, sliderY, sliderWidth, sliderHeight, DARKGREY);
+    M5.Lcd.drawRect(sliderX, sliderY, sliderWidth, sliderHeight, WHITE);
+    
+    // Calculate knob position based on coefficient (0.80 to 1.20 range)
+    float sliderPos = (calibrationCoeff - 0.80f) / 0.40f;  // Normalize to 0-1
+    sliderKnobX = sliderX + (int)(sliderPos * (sliderWidth - 20));
+    
+    // Draw slider knob
+    M5.Lcd.fillRect(sliderKnobX, sliderY - 5, 20, sliderHeight + 10, BLUE);
+    M5.Lcd.drawRect(sliderKnobX, sliderY - 5, 20, sliderHeight + 10, WHITE);
+    
+    // Draw scale marks
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setTextColor(YELLOW);
+    M5.Lcd.setCursor(sliderX, sliderY + 25);
+    M5.Lcd.print("0.80");
+    M5.Lcd.setCursor(sliderX + sliderWidth/2 - 10, sliderY + 25);
+    M5.Lcd.print("1.00");
+    M5.Lcd.setCursor(sliderX + sliderWidth - 25, sliderY + 25);
+    M5.Lcd.print("1.20");
+}
+
+void drawCalibrationTab() {
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.setTextSize(2);
+    
+    // Display header with tab indicator - MODIFIED FOR UNIT 2
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.println("Calibration 2 [3/3]");
+    
+    // Display current coefficient
+    M5.Lcd.setCursor(10, 50);
+    M5.Lcd.print("Coefficient: ");
+    M5.Lcd.setTextColor(CYAN);
+    M5.Lcd.printf("%.3f", calibrationCoeff);
+    
+    // Display pulses per liter
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.setCursor(10, 80);
+    M5.Lcd.print("Pulses/L: ");
+    M5.Lcd.setTextColor(CYAN);
+    M5.Lcd.printf("%.0f", getCurrentPulsesPerLiter());
+    
+    // Display ml per pulse
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.setCursor(10, 110);
+    M5.Lcd.print("mL/Pulse: ");
+    M5.Lcd.setTextColor(CYAN);
+    M5.Lcd.printf("%.4f", getMlPerPulse());
+    
+    // Draw calibration slider
+    drawSlider();
+    
+    // Display instructions
+    M5.Lcd.setTextColor(YELLOW);
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setCursor(10, 180);
+    M5.Lcd.println("Touch slider to adjust calibration");
+    M5.Lcd.setCursor(10, 195);
+    M5.Lcd.println("Lower = Less volume per pulse");
+    M5.Lcd.setCursor(10, 210);
+    M5.Lcd.println("Higher = More volume per pulse");
+    
+    // Display button instructions at bottom
+    M5.Lcd.setTextColor(YELLOW);
+    M5.Lcd.setCursor(10, 225);
+    M5.Lcd.println("A:Reset  B:Next Tab  C:Next Tab");
+}
+
+void handleSliderTouch() {
+    TouchPoint_t pos = M5.Touch.getPressPoint();
+    
+    if (pos.x != -1 && pos.y != -1) {  // Valid touch
+        // Check if touch is within slider area
+        if (pos.x >= sliderX && pos.x <= sliderX + sliderWidth &&
+            pos.y >= sliderY - 10 && pos.y <= sliderY + sliderHeight + 10) {
+            
+            // Calculate new coefficient based on touch position
+            float touchPos = (float)(pos.x - sliderX) / (float)sliderWidth;
+            touchPos = constrain(touchPos, 0.0f, 1.0f);  // Clamp to 0-1
+            
+            // Convert to coefficient range (0.80 to 1.20)
+            calibrationCoeff = 0.80f + (touchPos * 0.40f);
+            calibrationCoeff = constrain(calibrationCoeff, 0.80f, 1.20f);
+            
+            Serial.printf("Slider touched: pos=%.2f, coeff=%.3f, pulses/L=%.0f, mL/pulse=%.4f\n", 
+                         touchPos, calibrationCoeff, getCurrentPulsesPerLiter(), getMlPerPulse());
+            
+            // Force immediate display update
+            lastDisplayUpdate = 0;
+        }
+    }
+}
+
+void updateDisplay() {
+    // Only update display every 1000ms to prevent flicker and improve button responsiveness
+    if (millis() - lastDisplayUpdate < 1000) {
+        return;
+    }
+    lastDisplayUpdate = millis();
+    
+    if (currentTab == 0) {
+        drawFlowDataTab();
+    } else if (currentTab == 1) {
+        drawNetworkInfoTab();
+    } else {
+        drawCalibrationTab();
+    }
+}
+
+void setup() {
+    M5.begin();
+    Serial.begin(115200);
+    Serial.println("Flow Sensor Unit 2 initializing...");
+    
+    // Initialize flow sensor
+    pinMode(FLOW_SENSOR_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), pulseCounter, FALLING);
+    
+    // Connect to WiFi
+    connectWiFi();
+    
+    // Initialize display
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(10, 30);
+    M5.Lcd.println("Flow Sensor Unit 2");
+    M5.Lcd.setCursor(10, 70);
+    M5.Lcd.println("Connecting to WiFi...");
+    
+    lastUpdateTime = millis();
+    lastPulseTime = millis();
+}
+
+void loop() {
+    M5.update();
+    
+    // Check for button presses
+    if (M5.BtnA.wasPressed()) {
+        Serial.println("Button A pressed - Resetting volume counter");
+        resetVolumeCounter();
+    }
+    
+    if (M5.BtnB.wasPressed()) {
+        // Cycle through tabs: 0 -> 1 -> 2 -> 0
+        currentTab = (currentTab + 1) % 3;
+        Serial.printf("Button B pressed - Switched to tab %d\n", currentTab);
+        // Force immediate display update
+        lastDisplayUpdate = 0;
+        updateDisplay();
+    }
+    
+    if (M5.BtnC.wasPressed()) {
+        // Cycle through tabs: 0 -> 1 -> 2 -> 0
+        currentTab = (currentTab + 1) % 3;
+        Serial.printf("Button C pressed - Switched to tab %d\n", currentTab);
+        // Force immediate display update
+        lastDisplayUpdate = 0;
+        updateDisplay();
+    }
+    
+    // Handle touch input for calibration slider
+    if (currentTab == 2) {  // Only handle touch on calibration tab
+        handleSliderTouch();
+    }
+    
+    // Check dispensing status for auto-reset
+    checkDispensingStatus();
+    
+    // Update flow sensor readings
+    updateFlowSensor();
+    
+    // Send data to main unit every 500ms (twice per second)
+    static unsigned long lastSendTime = 0;
+    if (millis() - lastSendTime >= 500) {
+        sendDataToMainUnit();
+        lastSendTime = millis();
+    }
+    
+    // Update display
+    updateDisplay();
+} 
